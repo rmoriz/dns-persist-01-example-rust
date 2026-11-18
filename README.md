@@ -131,3 +131,7 @@ $ cargo run -- other-config.toml
 ```
 
 Requires Rust 1.88 or newer.
+
+---
+
+Built with [OpenCode 2](https://opencode.ai) and DeepSeek V4.1 Flash Uncensored (Yeta AI).
