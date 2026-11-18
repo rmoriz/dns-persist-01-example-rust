@@ -5,7 +5,8 @@
 #
 # List the apex name and its `*.` wildcard together to get both on one
 # certificate. The validation record always stays at the base domain, so
-# "devstage.de" and "*.devstage.de" share the same record.
+# "example.com" and "*.example.com" share the same record. See the
+# "Wildcard certificates" section of the README.
 domains = ["example.com", "*.example.com"]
 
 # Contact URI sent when the ACME account is created. Change this.

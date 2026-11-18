@@ -41,11 +41,8 @@ table is Google's documented `dns-persist-01` endpoint and Issuer Domain Name;
 `ttl` only affects DNS caching.
 
 Every entry becomes one identifier of the order and one subject alternative
-name on the certificate. List an apex name and its `*.` wildcard together:
-both share the single `_validation-persist` record at the base domain, and a
-`*.` entry automatically adds `policy=wildcard` to it. `policy_wildcard`
-forces that policy for orders without a wildcard entry, but by itself it only
-extends the record; it does not put a `*.` name on the certificate.
+name on the certificate. See [Wildcard certificates](#wildcard-certificates)
+for the `*.` syntax.
 
 Google Trust Services requires External Account Binding. Create an EAB
 credential in the GTS console, then set `eab_kid` and the base64url
@@ -87,6 +84,58 @@ hello from a dns-persist-01 certificate
 > a browser configured to use DNS-over-HTTPS bypasses `/etc/hosts` and may not
 > reach the local server. In that case use `curl` or a browser that uses the
 > system DNS resolver, or open <https://localhost:8443/>.
+
+## Wildcard certificates
+
+A wildcard certificate needs two things: the wildcard name in `domains`, and a
+validation record carrying `policy=wildcard`. The record is published at the
+base domain, not at the wildcard, and serves the apex order and the wildcard
+order alike.
+
+```toml
+domains = ["example.com", "*.example.com"]
+```
+
+The example adds `policy=wildcard` automatically as soon as `domains` contains
+a `*.` entry (`policy_wildcard = true` forces it too), and the first run prints
+one record for both names:
+
+```text
+  Name:  _validation-persist.example.com.
+  Type:  TXT
+  TTL:   3600
+  Value: "pki.goog; accounturi=...; policy=wildcard"
+```
+
+Publish that record and press Enter. The issued certificate then carries both
+names:
+
+```console
+$ openssl x509 -in state/cert.pem -noout -ext subjectAltName
+X509v3 Subject Alternative Name:
+    DNS:example.com, DNS:*.example.com
+$ curl --resolve foo.example.com:8443:127.0.0.1 https://foo.example.com:8443/
+hello from a dns-persist-01 certificate
+```
+
+Things worth knowing:
+
+- The draft requires `policy=wildcard` whenever the authorization is a
+  wildcard (sections 5 and 6 of
+  [draft-ietf-acme-dns-persist-03](https://datatracker.ietf.org/doc/html/draft-ietf-acme-dns-persist-03)).
+  Without it the record only authorizes the exact name, and the wildcard
+  authorization fails validation. Because the record is persistent, publish it
+  with the policy from the start instead of adding it later.
+- A wildcard certificate covers exactly one label: `foo.example.com` yes,
+  `a.b.example.com` no. Add `*.sub.example.com` if you need that, but note the
+  record then sits at `_validation-persist.sub.example.com` — this example
+  validates every entry at its own record name and does not use the draft's
+  `ancestorDomain` to reuse the apex record.
+- Only `*.` at the leftmost position is allowed. `domains = ["*.example.com"]`
+  without the apex issues a wildcard-only certificate.
+- The validation record is a plain TXT record at `_validation-persist`; you do
+  not need a wildcard DNS record for validation. You do still need `A`/`AAAA`
+  records for the names you actually serve.
 
 ## Renewals
 
