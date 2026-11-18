@@ -12,7 +12,7 @@ base64 = "0.23"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
-instant-acme = { path = "../instant-acme", features = ["rcgen"] }
+instant-acme = { git = "https://github.com/rmoriz/instant-acme", branch = "dns-persist-01", features = ["rcgen"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }

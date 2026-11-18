@@ -108,11 +108,14 @@ account then uses the raw account URL, which Pebble validates.
 
 ## Library dependency
 
-The example uses `../instant-acme` via a path dependency, on the local
-`dns-persist-01` branch. Google currently serves the draft-01 dialect; the
-draft-01 compatibility in the library (raw `accounturi` when the directory has
-no `accountHashPrefix`, plus the `issuer-domain-names` spelling) lives in that
-working tree and is not part of PR #360.
+The example depends on the `dns-persist-01` branch of
+<https://github.com/rmoriz/instant-acme> (the branch behind
+[PR #360](https://github.com/djc/instant-acme/pull/360)). Cargo fetches it from
+GitHub, so no local checkout is needed.
+
+Google currently serves the draft-01 dialect; the branch includes the
+draft-01 compatibility (raw `accounturi` when the directory has no
+`accountHashPrefix`, plus the `issuer-domain-names` spelling).
 
 ## Options
 

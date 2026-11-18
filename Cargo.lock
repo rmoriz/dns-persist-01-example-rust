@@ -474,6 +474,7 @@ dependencies = [
 [[package]]
 name = "instant-acme"
 version = "0.9.0"
+source = "git+https://github.com/rmoriz/instant-acme?branch=dns-persist-01#c9ecce7ffbf86974cc598603b95dddf838136e24"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
