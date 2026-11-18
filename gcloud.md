@@ -1,79 +1,78 @@
-# Google-Cloud-Projekt für Public CA aufsetzen (ohne Kostenrisiko)
+# Set up a Google Cloud project for Public CA (without cost risk)
 
-Dieses Dokument beschreibt, wie du ein eigenes Google-Cloud-Projekt für
-Zertifikate über Google Trust Services / Public CA anlegst und einen Nutzer
-erzeugst, der **nur** External-Account-Keys (EAB) für ACME anlegen darf — und
-sonst nichts.
+This document describes how to create your own Google Cloud project for
+certificates via Google Trust Services / Public CA and create a user that is
+allowed to create **only** External Account Keys (EAB) for ACME — and nothing
+else.
 
-Ziel ist bewusst die kleinste sinnvolle Berechtigung:
+The goal is deliberately the smallest sensible permission set:
 
-- kein `roles/owner`, kein `roles/editor`, keine Projekt-Adminrechte
-- kein hinterlegtes Rechnungskonto, damit keine kostenpflichtigen Dienste
-  aktiviert werden können
-- Public CA selbst ist kostenlos und funktioniert nachweislich ohne Billing
+- no `roles/owner`, no `roles/editor`, no project admin rights
+- no linked billing account, so no paid services can be enabled
+- Public CA itself is free and demonstrably works without billing
 
-> **Wichtig:** Der Nutzer legt nur EAB-Secrets an. Das eigentliche Zertifikat
-> holt danach dein ACME-Client (hier: `dns-persist-01`) — dafür braucht es
-> **gar keine** Google-Cloud-Anmeldung mehr. Die EAB-Daten sind der einzige
-> Berührungspunkt mit dem Projekt.
+> **Important:** The user only creates EAB secrets. Your ACME client (here:
+> `dns-persist-01`) then obtains the actual certificate — for that it needs
+> **no** Google Cloud login at all anymore. The EAB data is the only point of
+> contact with the project.
 
-## Begriffe
+## Terms
 
-| Begriff                      | Bedeutung                                                                 |
-| ---------------------------- | ------------------------------------------------------------------------- |
-| Public CA                    | ACME-CA von Google Trust Services, kostenlos, EAB-pflichtig                |
-| EAB (External Account Binding) | Schlüsselpaar `keyId` + `b64MacKey`, bindet dein ACME-Konto an das Projekt |
-| `roles/publicca.externalAccountKeyCreator` | Einzige Rolle, die zum Erzeugen von EAB-Secrets nötig ist     |
+| Term                         | Meaning                                                                  |
+| ---------------------------- | ------------------------------------------------------------------------ |
+| Public CA                    | ACME CA from Google Trust Services, free, EAB required                   |
+| EAB (External Account Binding) | Key pair `keyId` + `b64MacKey`, binds your ACME account to the project |
+| `roles/publicca.externalAccountKeyCreator` | The only role needed to create EAB secrets                |
 
-## Schritt 1 — Projekt anlegen (ohne Rechnungskonto)
+## Step 1 — Create the project (without a billing account)
 
-Als Projekt-Ersteller brauchst du `roles/resourcemanager.projectCreator`
-(typischerweise über eine Folder-Rolle oder Owner in der Organisation). Ein
-Rechnungskonto ist **nicht** erforderlich.
+As the project creator you need `roles/resourcemanager.projectCreator`
+(typically via a folder role or Owner in the organization). A billing account
+is **not** required.
 
 ```bash
 gcloud projects create dns-persist-ca --name="dns-persist CA"
 gcloud config set project dns-persist-ca
 ```
 
-Prüfen, dass wirklich kein Billing verknüpft ist:
+Verify that no billing is actually linked:
 
 ```bash
 gcloud billing projects describe dns-persist-ca
-# Erwartet: billingEnabled: false
+# Expected: billingEnabled: false
 ```
 
-Ohne Rechnungskonto lässt sich kein kostenpflichtiger Dienst aktivieren — das
-ist die stärkste Absicherung gegen versehentliche Kosten.
+Without a billing account, no paid service can be enabled — that is the
+strongest safeguard against accidental costs.
 
-## Schritt 2 — Public-CA-API aktivieren
+## Step 2 — Enable the Public CA API
 
-Das macht der Admin einmalig, damit der eingeschränkte Nutzer später nur noch
-Keys ziehen muss (er darf keine APIs aktivieren):
+The admin does this once so that the restricted user later only has to fetch
+keys (the user is not allowed to enable APIs):
 
 ```bash
 gcloud services enable publicca.googleapis.com
 ```
 
-Prüfen:
+Verify:
 
 ```bash
 gcloud services list --enabled --filter="config.name:publicca.googleapis.com"
 ```
 
-## Schritt 3 — Nutzer anlegen
+## Step 3 — Create the user
 
-### Variante A — menschlicher Nutzer (empfohlen für den Einstieg)
+### Option A — human user (recommended to get started)
 
-Nimm ein **eigenes** Google-Konto, nicht dein Hauptkonto. Entweder ein
-Workspace-Konto in deiner Domain oder ein separates Google-Konto:
+Use a **separate** Google account, not your main account. Either a Workspace
+account in your domain or a dedicated Google account:
 
 ```bash
 export CERT_USER="acme-certs@example.com"
 ```
 
-Alternativ ein Dienstkonto, wenn später alles automatisiert läuft
-(Variante B):
+Alternatively a service account if everything will run automated later
+(Option B):
 
 ```bash
 gcloud iam service-accounts create acme-certs \
@@ -81,7 +80,7 @@ gcloud iam service-accounts create acme-certs \
 export CERT_USER="acme-certs@$(gcloud config get-value project).iam.gserviceaccount.com"
 ```
 
-## Schritt 4 — Minimale Rolle vergeben
+## Step 4 — Grant the minimal role
 
 ```bash
 gcloud projects add-iam-policy-binding dns-persist-ca \
@@ -89,16 +88,17 @@ gcloud projects add-iam-policy-binding dns-persist-ca \
   --role="roles/publicca.externalAccountKeyCreator"
 ```
 
-Bei einem Dienstkonto entsprechend `--member="serviceAccount:${CERT_USER}"`.
+For a service account use `--member="serviceAccount:${CERT_USER}"`
+accordingly.
 
-Die Rolle enthält genau eine Berechtigung:
-`publicca.externalAccountKeys.create`. Sie erlaubt **kein** Auflisten, kein
-Löschen, kein IAM, keine API-Aktivierung und keinen Zugriff auf andere Dienste.
+The role contains exactly one permission:
+`publicca.externalAccountKeys.create`. It allows **no** listing, no deletion,
+no IAM, no API activation, and no access to other services.
 
-### Noch enger: eigene Rolle
+### Even tighter: a custom role
 
-Wenn dir die vordefinierte Rolle zu breit ist (sie ist es praktisch nicht),
-baue eine Custom Role mit exakt einer Berechtigung:
+If the predefined role is too broad for you (in practice it is not), build a
+custom role with exactly one permission:
 
 ```bash
 gcloud iam roles create acmeEabOnly \
@@ -111,10 +111,10 @@ gcloud projects add-iam-policy-binding dns-persist-ca \
   --role="projects/dns-persist-ca/roles/acmeEabOnly"
 ```
 
-## Schritt 5 — Berechtigungen prüfen
+## Step 5 — Check the permissions
 
-Policy ansehen — es darf **nur** der eine Binding-Eintrag für den Nutzer
-existieren (plus die Owner deines Admins):
+Inspect the policy — **only** the one binding entry for the user may exist
+(plus your admin's Owner bindings):
 
 ```bash
 gcloud projects get-iam-policy dns-persist-ca \
@@ -122,91 +122,91 @@ gcloud projects get-iam-policy dns-persist-ca \
   --format="table(bindings.role:label=ROLE, bindings.members:label=MEMBER)"
 ```
 
-Gegenprobe als eingeschränkter Nutzer — das muss fehlschlagen:
+Counter-check as the restricted user — this must fail:
 
 ```bash
 gcloud auth login "${CERT_USER}"
 gcloud config set project dns-persist-ca
-gcloud services list --enabled   # PERMISSION_DENIED / fehlende serviceusage-Rechte
+gcloud services list --enabled   # PERMISSION_DENIED / missing serviceusage permissions
 gcloud projects get-iam-policy dns-persist-ca  # PERMISSION_DENIED
 ```
 
-## Schritt 6 — EAB-Secret erzeugen
+## Step 6 — Create an EAB secret
 
 ```bash
 gcloud publicca external-account-keys create --format=json
 ```
 
-Ausgabe:
+Output:
 
 ```json
 { "b64MacKey": "…", "keyId": "…" }
 ```
 
-Beides in `config.toml` eintragen:
+Put both into `config.toml`:
 
 ```toml
 eab_kid = "…keyId…"
 eab_hmac_key = "…b64MacKey (base64url)…"
 ```
 
-`config.toml` ist hier git-ignoriert und enthält damit kein Secret im Repo.
+`config.toml` is git-ignored here, so no secret ends up in the repository.
 
-### Regeln für EAB-Secrets
+### Rules for EAB secrets
 
-- **7 Tage gültig**, danach verfällt das Secret unbenutzt.
-- **Einmalig**: Nach der Registrierung des ACME-Kontos ist das Secret
-  verbraucht; ein weiterer Account braucht ein neues Secret.
-- Pro ACME-Konto ein eigenes Secret — nicht wiederverwenden.
-- Das ACME-Konto selbst läuft nicht ab.
+- **Valid for 7 days**, after which the secret expires unused.
+- **Single use**: after the ACME account is registered, the secret is used up;
+  another account needs a new secret.
+- One secret per ACME account — do not reuse.
+- The ACME account itself does not expire.
 
-## Schritt 7 — Zertifikat holen
+## Step 7 — Obtain the certificate
 
 ```bash
 cargo run
 ```
 
-Der `dns-persist-01`-Record wird einmalig veröffentlicht; danach laufen
-Erneuerungen ohne DNS-Änderung und ohne gcloud-Zugriff.
+The `dns-persist-01` record is published once; afterwards renewals run
+without DNS changes and without gcloud access.
 
-## Betrieb
+## Operations
 
-- **Projekt nicht löschen.** Das löscht alle ACME-Konten; danach sind
-  Erneuerungen unmöglich, auch nach `gcloud projects undelete`.
-- **Quota teilt sich pro Projekt.** Ein Nutzer mit der Rolle kann bis zu
-  100 ACME-Konten pro Stunde anlegen (Limit `newAccount`: 25/min, 100/h).
-  Zusätzlich gelten 100 `newOrder`/h und 300 `newAuthz`/h. Ein wildgewordener
-  Client kann dir also die Erneuerung anderer Domains im selben Projekt
-  blockieren — bei mehreren Domains besser ein Projekt pro Domain.
-- **Nutzer deaktivieren statt Key löschen.** EAB-Keys verwaltet nur der
-  Admin; zum Sperren reicht es, das Konto zu deaktivieren oder das Binding zu
-  entfernen.
-- **CAA prüfen.** Falls du CAA-Records nutzt: `0 issue "pki.goog"`.
-- **Secret-Ablage.** EAB-Secrets nur in `config.toml`, Secret-Manager oder
-  CI-Variablen; nie committen.
+- **Do not delete the project.** That deletes all ACME accounts; afterwards
+  renewals are impossible, even after `gcloud projects undelete`.
+- **Quota is shared per project.** A user with the role can create up to 100
+  ACME accounts per hour (limit `newAccount`: 25/min, 100/h). In addition,
+  100 `newOrder`/h and 300 `newAuthz`/h apply. A runaway client can therefore
+  block renewals of other domains in the same project — for multiple domains,
+  prefer one project per domain.
+- **Deactivate the user instead of deleting the key.** Only the admin manages
+  EAB keys; deactivating the account or removing the binding is enough to
+  block it.
+- **Check CAA.** If you use CAA records: `0 issue "pki.goog"`.
+- **Secret storage.** Keep EAB secrets only in `config.toml`, Secret Manager,
+  or CI variables; never commit them.
 
-## Aufräumen
+## Cleanup
 
 ```bash
 gcloud projects remove-iam-policy-binding dns-persist-ca \
   --member="user:${CERT_USER}" \
   --role="roles/publicca.externalAccountKeyCreator"
 
-gcloud projects delete dns-persist-ca   # löscht auch alle ACME-Konten
+gcloud projects delete dns-persist-ca   # also deletes all ACME accounts
 ```
 
-## Anti-Patterns
+## Anti-patterns
 
-| Anti-Pattern                                   | Warum es weh tut                                              |
-| ---------------------------------------------- | ------------------------------------------------------------- |
-| `roles/owner` an den Zertifikat-Nutzer         | Darf alles, inkl. kostenpflichtiger Dienste (sofern Billing da) |
-| Rechnungskonto verknüpfen „für später“         | Öffnet die Tür zu kostenpflichtigen APIs                      |
-| EAB-Secret ins Repo committen                  | 7 Tage gültig, aber ein Leak bindet fremde ACME-Konten an dein Projekt |
-| Hauptkonto mit 2FA-Wechsel für Automatisierung | Login-Roulette in Cronjobs                                     |
-| Ein Projekt für alle Domains                   | Geteilte Quota — eine Domain blockiert die andere             |
+| Anti-pattern                                     | Why it hurts                                                    |
+| ------------------------------------------------ | --------------------------------------------------------------- |
+| `roles/owner` for the certificate user           | May do anything, including paid services (if billing exists)    |
+| Linking a billing account "for later"            | Opens the door to paid APIs                                     |
+| Committing the EAB secret to the repo            | Valid for 7 days, but a leak binds foreign ACME accounts to your project |
+| Main account with 2FA dance for automation       | Login roulette in cron jobs                                     |
+| One project for all domains                      | Shared quota — one domain blocks the other                      |
 
-## Weiterführend
+## Further reading
 
-- [Public CA Tutorial](https://docs.cloud.google.com/certificate-manager/docs/public-ca-tutorial?hl=de)
-- [Public-CA-Quotas](https://docs.cloud.google.com/certificate-manager/docs/quotas#public-ca-request-quotas)
-- [ACME Best Practices](https://developers.google.com/public-key-infrastructure/updates/september2025-acme-best-practices)
+- [Public CA tutorial](https://docs.cloud.google.com/certificate-manager/docs/public-ca-tutorial?hl=en)
+- [Public CA quotas](https://docs.cloud.google.com/certificate-manager/docs/quotas#public-ca-request-quotas)
+- [ACME best practices](https://developers.google.com/public-key-infrastructure/updates/september2025-acme-best-practices)
