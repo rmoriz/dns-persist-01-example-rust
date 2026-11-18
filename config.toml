@@ -1,0 +1,36 @@
+# The DNS name to obtain a certificate for.
+#
+# On the first run this example prints a `_validation-persist` TXT record for
+# this name. You must publish that record manually, then press Enter.
+domain = "example.com"
+
+# Contact URI sent when the ACME account is created. Change this.
+contact = "mailto:admin@example.com"
+
+# Address the HTTPS server listens on after the certificate is issued.
+bind = "0.0.0.0:8443"
+
+# Directory for the ACME account and the issued certificate/key.
+state_dir = "./state"
+
+[ca]
+# Google Trust Services production ACME directory.
+directory_url = "https://dv.acme-v02.api.pki.goog/directory"
+
+# Google's Issuer Domain Name, as documented for dns-persist-01.
+# See https://developers.google.com/public-key-infrastructure/updates/september2026-dns-persist-01
+issuer_domain_name = "pki.goog"
+
+# TTL for the TXT record printed on the first run.
+ttl = 3600
+
+# Google Trust Services requires External Account Binding. Create these in the
+# GTS console and paste them here.
+eab_kid = "REPLACE_WITH_EAB_KID"
+eab_hmac_key = "REPLACE_WITH_BASE64URL_HMAC_KEY"
+
+# Also authorize subdomains via policy=wildcard (safe for a single-name order).
+policy_wildcard = true
+
+# Optional custom root CA PEM for testing against a private ACME server (Pebble).
+# root_certificate = "ca.pem"
