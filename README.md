@@ -76,10 +76,10 @@ $ curl --resolve example.com:8443:127.0.0.1 https://example.com:8443/
 hello from a dns-persist-01 certificate
 ```
 
-> **DoH warning:** If your browser is configured to use DNS-over-HTTPS, it
-> resolves through its own resolver and may not see the TXT record or your
-> domain. In that case use `curl` or a browser that uses the system DNS
-> resolver.
+> **DoH warning:** If you mapped your domain to `127.0.0.1` in `/etc/hosts`,
+> a browser configured to use DNS-over-HTTPS bypasses `/etc/hosts` and may not
+> reach the local server. In that case use `curl` or a browser that uses the
+> system DNS resolver, or open <https://localhost:8443/>.
 
 ## Renewals
 
