@@ -24,7 +24,7 @@ $ cp config.toml.example config.toml
 `config.toml.example` is pre-filled with Google Trust Services values:
 
 ```toml
-domain = "example.com"
+domains = ["example.com", "*.example.com"]
 contact = "mailto:admin@example.com"
 
 [ca]
@@ -36,15 +36,16 @@ eab_hmac_key = "REPLACE_WITH_BASE64URL_HMAC_KEY"
 policy_wildcard = true
 ```
 
-Change `domain` to a name you control and `contact` to your address. The CA
+Change `domains` to names you control and `contact` to your address. The CA
 table is Google's documented `dns-persist-01` endpoint and Issuer Domain Name;
 `ttl` only affects DNS caching.
 
-Prefix `domain` with `*.` (e.g. `domain = "*.example.com"`) to request a
-wildcard certificate — the same `_validation-persist` record at the base
-domain authorizes it. `policy_wildcard` only adds `policy=wildcard` to that
-record, which lets it authorize wildcard names; it does not by itself put a
-`*.` name on the certificate.
+Every entry becomes one identifier of the order and one subject alternative
+name on the certificate. List an apex name and its `*.` wildcard together:
+both share the single `_validation-persist` record at the base domain, and a
+`*.` entry automatically adds `policy=wildcard` to it. `policy_wildcard`
+forces that policy for orders without a wildcard entry, but by itself it only
+extends the record; it does not put a `*.` name on the certificate.
 
 Google Trust Services requires External Account Binding. Create an EAB
 credential in the GTS console, then set `eab_kid` and the base64url
@@ -56,8 +57,8 @@ IAM user that may only create EAB keys.
 ## First run
 
 The account is created on first use and stored in `state/account.json`. The
-order starts with a pending authorization, and the server prints the exact
-record, for example:
+order starts with a pending authorization per name, and the server prints the
+exact record once (all names of a domain share it), for example:
 
 ```text
   Name:  _validation-persist.example.com.

@@ -5,6 +5,9 @@
 //! `_validation-persist` TXT record and waits for you to publish it and press
 //! Enter. Later runs reuse the persisted account, so the same record is
 //! regenerated and the authorization can succeed without changing DNS again.
+//!
+//! Every name in `domains` becomes an identifier of one order, so an apex name
+//! and its wildcard can share a single certificate and a single record.
 
 use std::{
     fs,
@@ -37,7 +40,8 @@ const ACCOUNT_FILE: &str = "account.json";
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    domain: String,
+    /// Names for the certificate, e.g. `["example.com", "*.example.com"]`.
+    domains: Vec<String>,
     #[serde(default)]
     contact: Option<String>,
     #[serde(default = "default_bind")]
@@ -104,7 +108,7 @@ fn load_config(path: &str) -> Result<Config> {
     })?;
     let mut config: Config = toml::from_str(&raw).context("parsing configuration")?;
 
-    config.domain = normalize_domain(&config.domain)?;
+    config.domains = normalize_domains(&config.domains)?;
     if !config.ca.directory_url.starts_with("https://") {
         bail!("ca.directory_url must be an https:// URL");
     }
@@ -125,6 +129,20 @@ fn load_config(path: &str) -> Result<Config> {
     }
 
     Ok(config)
+}
+
+fn normalize_domains(raw: &[String]) -> Result<Vec<String>> {
+    if raw.is_empty() {
+        bail!("config must list at least one entry in domains");
+    }
+    let mut domains = Vec::with_capacity(raw.len());
+    for name in raw {
+        let domain = normalize_domain(name)?;
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    Ok(domains)
 }
 
 fn normalize_domain(raw: &str) -> Result<String> {
@@ -206,23 +224,27 @@ async fn load_or_create_account(config: &Config) -> Result<Account> {
 }
 
 async fn obtain_certificate(account: &Account, config: &Config) -> Result<(String, String)> {
-    let identifier = Identifier::Dns(config.domain.clone());
-    let mut order = account
-        .new_order(&NewOrder::new(std::slice::from_ref(&identifier)))
-        .await?;
+    let identifiers = config
+        .domains
+        .iter()
+        .map(|domain| Identifier::Dns(domain.clone()))
+        .collect::<Vec<_>>();
+    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
     println!("dns-persist metadata: {:?}", account.dns_persist_metadata());
 
+    // All names of one domain share the same record, so only print it once.
+    let mut published: Vec<String> = Vec::new();
     let mut authorizations = order.authorizations();
     while let Some(authorization) = authorizations.next().await {
         let mut authorization = authorization?;
+        let identifier = authorization.identifier().to_string();
         if authorization.status == AuthorizationStatus::Valid {
-            println!("authorization for {} is still valid", config.domain);
+            println!("authorization for {identifier} is still valid");
             continue;
         }
         if authorization.status != AuthorizationStatus::Pending {
             bail!(
-                "authorization for {} is {:?}",
-                config.domain,
+                "authorization for {identifier} is {:?}",
                 authorization.status
             );
         }
@@ -244,8 +266,12 @@ async fn obtain_certificate(account: &Account, config: &Config) -> Result<(Strin
         } else {
             response
         };
-        print_record(&response, config.ca.ttl);
-        wait_for_enter().await?;
+        let record = format!("{}|{}", response.host(), response.rdata());
+        if !published.contains(&record) {
+            print_record(&response, config.ca.ttl);
+            wait_for_enter().await?;
+            published.push(record);
+        }
         challenge.set_ready().await?;
         println!("challenge submitted, waiting for validation");
     }
@@ -260,7 +286,7 @@ async fn obtain_certificate(account: &Account, config: &Config) -> Result<(Strin
 
     let key_pem = order.finalize().await?;
     let cert_pem = order.poll_certificate(&retry).await?;
-    println!("certificate issued for {}", config.domain);
+    println!("certificate issued for {}", config.domains.join(", "));
     Ok((cert_pem, key_pem))
 }
 
@@ -326,7 +352,11 @@ async fn serve(config: &Config, cert_pem: &str, key_pem: &str) -> Result<()> {
 
     let acceptor = TlsAcceptor::from(Arc::new(tls));
     let listener = TcpListener::bind(config.bind).await?;
-    println!("serving https://{} for {}", config.bind, config.domain);
+    println!(
+        "serving https://{} for {}",
+        config.bind,
+        config.domains.join(", ")
+    );
 
     loop {
         let (tcp, peer) = listener.accept().await?;
@@ -417,6 +447,7 @@ mod tests {
             config.ca.directory_url,
             "https://dv.acme-v02.api.pki.goog/directory"
         );
+        assert_eq!(config.domains, ["example.com", "*.example.com"]);
         assert_eq!(config.ca.issuer_domain_name, "pki.goog");
         assert_eq!(config.ca.ttl, 3600);
         assert_eq!(config.ca.eab_kid.as_deref(), Some("REPLACE_WITH_EAB_KID"));
@@ -438,9 +469,25 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_a_domain_list() {
+        let raw = [
+            " Example.COM. ".to_owned(),
+            "*.Example.COM.".to_owned(),
+            "www.example.com".to_owned(),
+            "*.example.com".to_owned(),
+        ];
+        assert_eq!(
+            normalize_domains(&raw).unwrap(),
+            ["example.com", "*.example.com", "www.example.com"]
+        );
+        assert!(normalize_domains(&[]).is_err());
+        assert!(normalize_domains(&["nope".to_owned()]).is_err());
+    }
+
+    #[test]
     fn defaults_apply() {
         let config: Config =
-            toml::from_str("domain = 'example.com'\n[ca]\ndirectory_url = 'https://ca.example/directory'\nissuer_domain_name = 'ca.example'")
+            toml::from_str("domains = ['example.com']\n[ca]\ndirectory_url = 'https://ca.example/directory'\nissuer_domain_name = 'ca.example'")
                 .unwrap();
         assert_eq!(config.bind.port(), 8443);
         assert_eq!(config.ca.ttl, 3600);

@@ -1,11 +1,12 @@
-# The DNS name to obtain a certificate for.
+# The DNS names to obtain a certificate for.
 #
 # On the first run this example prints a `_validation-persist` TXT record for
-# this name. You must publish that record manually, then press Enter.
+# these names. You must publish that record manually, then press Enter.
 #
-# Prefix the name with `*.` (for example "*.example.com") to request a
-# wildcard certificate. The validation record stays at the base domain.
-domain = "example.com"
+# List the apex name and its `*.` wildcard together to get both on one
+# certificate. The validation record always stays at the base domain, so
+# "devstage.de" and "*.devstage.de" share the same record.
+domains = ["example.com", "*.example.com"]
 
 # Contact URI sent when the ACME account is created. Change this.
 contact = "mailto:admin@example.com"
