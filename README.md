@@ -2,8 +2,14 @@
 
 [![CI](https://github.com/rmoriz/dns-persist-01-example-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/rmoriz/dns-persist-01-example-rust/actions/workflows/ci.yml)
 
-A small HTTPS server (or certificate-only agent) that gets its certificate with the ACME
-`dns-persist-01` challenge from [instant-acme](../instant-acme). The
+A small HTTPS server (or certificate-only agent) built entirely on the great
+[`djc/instant-acme`](https://github.com/djc/instant-acme) project, which does
+the ACME work — account handling, JWS signing, orders, challenges, renewal
+and certificate retrieval. This repository only adds config parsing, the
+`dns-persist-01` wiring, lifetime handling, the CT lookup and serving, so all
+credit for the protocol belongs upstream.
+
+The certificate is obtained with the ACME `dns-persist-01` challenge. The
 validation record is derived from your account, the domain and the CA, not
 from a per-order token. You publish it **once**; later runs reuse it.
 
@@ -276,12 +282,17 @@ Set `ca.root_certificate` to Pebble's root CA, `ca.issuer_domain_name` to
 `pebble.letsencrypt.org`, and `ca.directory_url` to your Pebble directory. The
 account then uses the raw account URL, which Pebble validates.
 
-## Library dependency
+## Library dependency and credit
 
-The example depends on the `dns-persist-01` branch of
-<https://github.com/rmoriz/instant-acme> (the branch behind
-[PR #360](https://github.com/djc/instant-acme/pull/360)). Cargo fetches it from
-GitHub, so no local checkout is needed.
+Everything protocol-related is [`instant-acme`](https://github.com/djc/instant-acme)
+by [djc](https://github.com/djc) and its contributors, available under
+Apache-2.0. An example like this would be a lot of work without it.
+
+Cargo points at the `dns-persist-01` branch of the fork
+<https://github.com/rmoriz/instant-acme> — the branch behind
+[PR #360](https://github.com/djc/instant-acme/pull/360) — because
+`dns-persist-01` is not merged yet. It is fetched from GitHub, so no local
+checkout is needed.
 
 Google currently serves the draft-01 dialect; the branch includes the
 draft-01 compatibility (raw `accounturi` when the directory has no
