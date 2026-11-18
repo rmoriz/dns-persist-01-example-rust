@@ -44,6 +44,9 @@ Google Trust Services requires External Account Binding. Create an EAB
 credential in the GTS console, then set `eab_kid` and the base64url
 `eab_hmac_key`. If the CA does not require EAB, omit both fields.
 
+[`gcloud.md`](gcloud.md) walks through a cost-free Google Cloud project and an
+IAM user that may only create EAB keys.
+
 ## First run
 
 The account is created on first use and stored in `state/account.json`. The
