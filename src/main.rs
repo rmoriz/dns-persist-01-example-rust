@@ -20,7 +20,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -77,6 +77,14 @@ struct Config {
     bind: SocketAddr,
     #[serde(default = "default_state_dir")]
     state_dir: PathBuf,
+    /// Serve HTTPS after issuing. Disable for certificate-only use.
+    #[serde(default = "default_true")]
+    serve: bool,
+    /// Program run after every successful issuance, once the files are written.
+    /// Receives DNS_PERSIST_DOMAINS, DNS_PERSIST_CERT, DNS_PERSIST_KEY and
+    /// DNS_PERSIST_NOT_AFTER in its environment.
+    #[serde(default)]
+    renew_hook: Option<PathBuf>,
     ca: CaConfig,
 }
 
@@ -145,6 +153,7 @@ async fn main() -> Result<()> {
             fs::write(config.state_dir.join("cert.pem"), cert_pem.as_bytes())
                 .context("writing certificate")?;
             write_secret(&config.state_dir.join("key.pem"), key_pem.as_bytes())?;
+            after_issuance(&config).await;
             (cert_pem, key_pem)
         }
     };
@@ -153,7 +162,13 @@ async fn main() -> Result<()> {
     let store = Arc::new(CertStore::new(&cert_pem, &key_pem)?);
     tokio::spawn(renewal_loop(account, config.clone(), store.clone()));
 
-    serve(&config, store).await
+    if config.serve {
+        serve(&config, store).await
+    } else {
+        println!("HTTPS server disabled, renewing only");
+        std::future::pending::<()>().await;
+        Ok(())
+    }
 }
 
 /// Reuse the stored certificate while it still covers every name and is not
@@ -303,6 +318,7 @@ async fn renewal_loop(account: Account, config: Config, store: Arc<CertStore>) {
                 match write {
                     Ok(()) => {
                         println!("certificate renewed");
+                        after_issuance(&config).await;
                         report_ct(config.clone()).await;
                     }
                     Err(err) => eprintln!("renewal check: storing certificate: {err:#}"),
@@ -336,6 +352,11 @@ fn load_config(path: &str) -> Result<Config> {
         bail!("ca.ttl must be greater than zero");
     }
     validate_renewal(config.certificate_days, config.renew_before_days)?;
+    if let Some(hook) = &config.renew_hook
+        && !hook.is_file()
+    {
+        bail!("renew_hook {} does not exist", hook.display());
+    }
     if config.renew_check_interval_secs == 0 {
         bail!("renew_check_interval_secs must be greater than zero");
     }
@@ -543,6 +564,43 @@ fn challenge_types(authorization: &instant_acme::AuthorizationHandle<'_>) -> Vec
             _ => "unknown",
         })
         .collect()
+}
+
+async fn run_hook(config: &Config) -> Result<()> {
+    let Some(hook) = &config.renew_hook else {
+        return Ok(());
+    };
+    let cert_path = config.state_dir.join("cert.pem");
+    let pem = fs::read_to_string(&cert_path).context("reading certificate for renew_hook")?;
+    let not_after = leaf_not_after(&pem)?;
+    let not_after = OffsetDateTime::from_unix_timestamp(
+        not_after
+            .duration_since(UNIX_EPOCH)
+            .context("certificate expiry before the epoch")?
+            .as_secs() as i64,
+    )?;
+
+    let mut command = tokio::process::Command::new(hook);
+    command
+        .current_dir(&config.state_dir)
+        .env("DNS_PERSIST_DOMAINS", config.domains.join(" "))
+        .env("DNS_PERSIST_CERT", &cert_path)
+        .env("DNS_PERSIST_KEY", config.state_dir.join("key.pem"))
+        .env("DNS_PERSIST_NOT_AFTER", not_after.format(&Rfc3339)?)
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(Duration::from_secs(60), command.status())
+        .await
+        .context("renew_hook timed out after 60s")??;
+    if !status.success() {
+        bail!("renew_hook exited with {status}");
+    }
+    Ok(())
+}
+
+async fn after_issuance(config: &Config) {
+    if let Err(err) = run_hook(config).await {
+        eprintln!("renew hook failed: {err:#}");
+    }
 }
 
 async fn report_ct(config: Config) {
@@ -1122,6 +1180,75 @@ mod tests {
         assert!(ct_parse_time("2026-11-18T00:00:26").is_some());
         assert!(ct_parse_time("2026-11-18T00:00:26Z").is_some());
         assert!(ct_parse_time("not a date").is_none());
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("dns-persist-{name}-{unique}"))
+    }
+
+    #[test]
+    fn serves_and_has_no_hook_by_default() {
+        let path = temp_path("config.toml");
+        fs::write(
+            &path,
+            "domains = ['example.com']\n[ca]\ndirectory_url = 'https://ca.example/directory'\nissuer_domain_name = 'ca.example'",
+        )
+        .unwrap();
+        let config = load_config(path.to_str().unwrap()).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(config.serve);
+        assert!(config.renew_hook.is_none());
+    }
+
+    #[test]
+    fn rejects_a_missing_hook() {
+        let path = temp_path("config.toml");
+        fs::write(
+            &path,
+            "domains = ['example.com']\nrenew_hook = '/nope/definitely-not-here'\n[ca]\ndirectory_url = 'https://ca.example/directory'\nissuer_domain_name = 'ca.example'",
+        )
+        .unwrap();
+        assert!(load_config(path.to_str().unwrap()).is_err());
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn runs_the_renewal_hook_with_the_certificate_path() {
+        let dir = temp_path("hook");
+        fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = self_signed(&["example.com"], 7);
+        fs::write(dir.join("cert.pem"), cert).unwrap();
+        fs::write(dir.join("key.pem"), key).unwrap();
+        let hook = dir.join("hook.sh");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s|%s' \"$DNS_PERSIST_CERT\" \"$DNS_PERSIST_NOT_AFTER\" > hook.out\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "domains = ['example.com']\nstate_dir = '{}'\nrenew_hook = '{}'\n[ca]\ndirectory_url = 'https://ca.example/directory'\nissuer_domain_name = 'ca.example'",
+                dir.display(),
+                hook.display()
+            ),
+        )
+        .unwrap();
+        let config = load_config(path.to_str().unwrap()).unwrap();
+
+        run_hook(&config).await.unwrap();
+        let written = fs::read_to_string(dir.join("hook.out")).unwrap();
+        assert!(written.contains("cert.pem"));
+        assert!(written.contains('T'));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

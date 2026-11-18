@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/rmoriz/dns-persist-01-example-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/rmoriz/dns-persist-01-example-rust/actions/workflows/ci.yml)
 
-A small HTTPS server that gets its certificate with the ACME
+A small HTTPS server (or certificate-only agent) that gets its certificate with the ACME
 `dns-persist-01` challenge from [instant-acme](../instant-acme). The
 validation record is derived from your account, the domain and the CA, not
 from a per-order token. You publish it **once**; later runs reuse it.
@@ -210,6 +210,55 @@ Set `ct_lookup = false` to skip the lookup. Failures are warnings and never
 affect issuance or renewal. Revoked certificates are listed and marked
 `revoked`.
 
+## Certificate-only use and renew hook
+
+Set `serve = false` when only the files in `state_dir` matter, for example
+because a reverse proxy or mail server terminates TLS. The process stays
+running and keeps renewing; it just does not bind a port.
+
+`renew_hook` names a program that runs after every successful issuance, the
+first one included, once the new files are on disk. It runs with the state
+directory as working directory and gets:
+
+| Variable | Value |
+| --- | --- |
+| `DNS_PERSIST_DOMAINS` | configured names, space separated |
+| `DNS_PERSIST_CERT` | absolute path of the certificate |
+| `DNS_PERSIST_KEY` | absolute path of the private key |
+| `DNS_PERSIST_NOT_AFTER` | expiry as RFC 3339 |
+
+```toml
+serve = false
+renew_hook = "/usr/local/bin/reload-proxy"
+```
+
+The hook must be executable, is killed after 60 seconds, and a failure is
+logged without failing the renewal. Shell scripts need an executable bit and a
+shebang; arguments are not supported, wrap them in the script.
+
+## systemd service
+
+`contrib/systemd/dns-persist-example.service` runs the example as a hardened,
+unprivileged service that restarts on failure. It expects the config under
+`/etc/dns-persist-example/` and the state under `/var/lib/dns-persist-example/`,
+so set `state_dir = "/var/lib/dns-persist-example"` in the config.
+
+```console
+$ sudo useradd --system --home /var/lib/dns-persist-example --shell /usr/sbin/nologin dns-persist
+$ cargo build --release
+$ sudo install -Dm755 target/release/dns-persist-example /usr/local/bin/dns-persist-example
+$ sudo install -Dm600 config.toml /etc/dns-persist-example/config.toml
+$ sudo install -Dm644 contrib/systemd/dns-persist-example.service /etc/systemd/system/
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now dns-persist-example
+$ journalctl -u dns-persist-example -f
+```
+
+The unit uses `ProtectHome=yes`, so keep config, state and hook outside home
+directories. Binding a port below 1024 needs
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` (commented in the unit). Every
+config edit needs `systemctl restart dns-persist-example`.
+
 ## Files
 
 | Path                 | Contents                                      |
@@ -247,6 +296,10 @@ $ cargo run -- other-config.toml
 ```
 
 Requires Rust 1.88 or newer.
+
+## License
+
+Apache-2.0, the same license as `instant-acme`; see [`LICENSE`](LICENSE).
 
 ---
 

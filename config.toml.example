@@ -34,6 +34,14 @@ bind = "0.0.0.0:8443"
 # Directory for the ACME account and the issued certificate/key.
 state_dir = "./state"
 
+# Serve HTTPS after issuing. Set to false when only the certificate files are
+# wanted; the process still stays up and renews.
+serve = true
+
+# Optional program run after every successful issuance, with the new files
+# already written. Beware: the state directory is its working directory.
+#renew_hook = "/usr/local/bin/reload-proxy"
+
 [ca]
 # Google Trust Services production ACME directory.
 directory_url = "https://dv.acme-v02.api.pki.goog/directory"

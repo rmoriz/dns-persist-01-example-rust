@@ -1,0 +1,37 @@
+[Unit]
+Description=dns-persist-01 certificate agent
+Documentation=https://github.com/rmoriz/dns-persist-01-example-rust
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dns-persist
+Group=dns-persist
+ExecStart=/usr/local/bin/dns-persist-example /etc/dns-persist-example/config.toml
+WorkingDirectory=/var/lib/dns-persist-example
+# systemd creates this directory; set state_dir = "/var/lib/dns-persist-example".
+StateDirectory=dns-persist-example
+StateDirectoryMode=0700
+ConfigurationDirectory=dns-persist-example
+Restart=on-failure
+RestartSec=10s
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Only needed when bind is below 1024, e.g. "0.0.0.0:443".
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
