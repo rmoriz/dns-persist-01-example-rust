@@ -76,6 +76,11 @@ $ curl --resolve example.com:8443:127.0.0.1 https://example.com:8443/
 hello from a dns-persist-01 certificate
 ```
 
+> **DoH warning:** If your browser is configured to use DNS-over-HTTPS, it
+> resolves through its own resolver and may not see the TXT record or your
+> domain. In that case use `curl` or a browser that uses the system DNS
+> resolver.
+
 ## Renewals
 
 Run the same command again. The persisted account regenerates the same record,
