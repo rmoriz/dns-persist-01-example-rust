@@ -38,7 +38,13 @@ policy_wildcard = true
 
 Change `domain` to a name you control and `contact` to your address. The CA
 table is Google's documented `dns-persist-01` endpoint and Issuer Domain Name;
-`ttl` only affects DNS caching. `policy_wildcard` also authorizes subdomains.
+`ttl` only affects DNS caching.
+
+Prefix `domain` with `*.` (e.g. `domain = "*.example.com"`) to request a
+wildcard certificate — the same `_validation-persist` record at the base
+domain authorizes it. `policy_wildcard` only adds `policy=wildcard` to that
+record, which lets it authorize wildcard names; it does not by itself put a
+`*.` name on the certificate.
 
 Google Trust Services requires External Account Binding. Create an EAB
 credential in the GTS console, then set `eab_kid` and the base64url

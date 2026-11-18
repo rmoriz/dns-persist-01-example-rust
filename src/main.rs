@@ -128,7 +128,11 @@ fn load_config(path: &str) -> Result<Config> {
 }
 
 fn normalize_domain(raw: &str) -> Result<String> {
-    let domain = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let trimmed = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let (wildcard, domain) = match trimmed.strip_prefix("*.") {
+        Some(domain) => ("*.", domain),
+        None => ("", trimmed.as_str()),
+    };
     if domain.is_empty() || domain.len() > 253 || !domain.contains('.') {
         bail!("domain {raw:?} is not a fully qualified domain name");
     }
@@ -144,7 +148,7 @@ fn normalize_domain(raw: &str) -> Result<String> {
             bail!("domain {raw:?} contains an invalid label");
         }
     }
-    Ok(domain)
+    Ok(format!("{wildcard}{domain}"))
 }
 
 async fn load_or_create_account(config: &Config) -> Result<Account> {
@@ -422,9 +426,15 @@ mod tests {
     #[test]
     fn normalizes_domains() {
         assert_eq!(normalize_domain(" Example.COM. ").unwrap(), "example.com");
+        assert_eq!(
+            normalize_domain("*.Example.COM. ").unwrap(),
+            "*.example.com"
+        );
         assert!(normalize_domain("example").is_err());
         assert!(normalize_domain("-example.com").is_err());
-        assert!(normalize_domain("*.example.com").is_err());
+        assert!(normalize_domain("*").is_err());
+        assert!(normalize_domain("*.*.example.com").is_err());
+        assert!(normalize_domain("foo.*.example.com").is_err());
     }
 
     #[test]

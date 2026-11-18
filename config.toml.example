@@ -2,6 +2,9 @@
 #
 # On the first run this example prints a `_validation-persist` TXT record for
 # this name. You must publish that record manually, then press Enter.
+#
+# Prefix the name with `*.` (for example "*.example.com") to request a
+# wildcard certificate. The validation record stays at the base domain.
 domain = "example.com"
 
 # Contact URI sent when the ACME account is created. Change this.
