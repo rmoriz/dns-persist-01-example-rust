@@ -8,40 +8,68 @@
 //!
 //! Every name in `domains` becomes an identifier of one order, so an apex name
 //! and its wildcard can share a single certificate and a single record.
+//!
+//! Certificates are requested with a short, configurable lifetime and renewed
+//! by the running process once they fall below `renew_before_days`. The TLS
+//! configuration is swapped in place, so no restart and no dropped listener.
 
 use std::{
     fs,
     io::{BufReader, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, RwLock},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
 use aws_lc_rs::hmac;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::{Request, StatusCode, body::Bytes, service::service_fn};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::{
+    client::legacy::Client,
+    rt::{TokioExecutor, TokioIo},
+};
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, CryptoProvider, DefaultClient,
     ExternalAccountKey, HmacKey, Identifier, NewAccount, NewOrder, RetryPolicy, SigningAlgorithm,
     challenges::dns_persist01,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{
+    crypto::aws_lc_rs::sign::any_supported_type,
+    pki_types::{CertificateDer, PrivateKeyDer},
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
+};
 use serde::Deserialize;
+use time::{
+    OffsetDateTime, PrimitiveDateTime, format_description::well_known::Rfc3339,
+    macros::format_description,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const ACCOUNT_FILE: &str = "account.json";
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct Config {
     /// Names for the certificate, e.g. `["example.com", "*.example.com"]`.
     domains: Vec<String>,
+    /// Requested certificate lifetime in days (Google allows 1 to 90).
+    #[serde(default = "default_certificate_days")]
+    certificate_days: u32,
+    /// Renew once less than this many days of lifetime remain (fractions allowed).
+    #[serde(default = "default_renew_before_days")]
+    renew_before_days: f64,
+    /// How often the running server checks the certificate lifetime.
+    #[serde(default = "default_renew_check_interval_secs")]
+    renew_check_interval_secs: u64,
+    /// Print still-valid certificates for these names from Certificate Transparency logs.
+    #[serde(default = "default_true")]
+    ct_lookup: bool,
     #[serde(default)]
     contact: Option<String>,
     #[serde(default = "default_bind")]
@@ -51,7 +79,7 @@ struct Config {
     ca: CaConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct CaConfig {
     directory_url: String,
     issuer_domain_name: String,
@@ -69,6 +97,22 @@ struct CaConfig {
     /// Custom root CA for testing (e.g. Pebble). Public CAs need no override.
     #[serde(default)]
     root_certificate: Option<PathBuf>,
+}
+
+fn default_certificate_days() -> u32 {
+    7
+}
+
+fn default_renew_before_days() -> f64 {
+    3.0
+}
+
+fn default_renew_check_interval_secs() -> u64 {
+    3600
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_bind() -> SocketAddr {
@@ -93,13 +137,179 @@ async fn main() -> Result<()> {
         .with_context(|| format!("creating state directory {}", config.state_dir.display()))?;
 
     let account = load_or_create_account(&config).await?;
-    let (cert_pem, key_pem) = obtain_certificate(&account, &config).await?;
+    let (cert_pem, key_pem) = match read_cached_certificate(&config)? {
+        Some(cached) => cached,
+        None => {
+            let (cert_pem, key_pem) = obtain_certificate(&account, &config).await?;
+            fs::write(config.state_dir.join("cert.pem"), cert_pem.as_bytes())
+                .context("writing certificate")?;
+            write_secret(&config.state_dir.join("key.pem"), key_pem.as_bytes())?;
+            (cert_pem, key_pem)
+        }
+    };
 
-    fs::write(config.state_dir.join("cert.pem"), cert_pem.as_bytes())
-        .context("writing certificate")?;
-    write_secret(&config.state_dir.join("key.pem"), key_pem.as_bytes())?;
+    tokio::spawn(report_ct(config.clone()));
+    let store = Arc::new(CertStore::new(&cert_pem, &key_pem)?);
+    tokio::spawn(renewal_loop(account, config.clone(), store.clone()));
 
-    serve(&config, &cert_pem, &key_pem).await
+    serve(&config, store).await
+}
+
+/// Reuse the stored certificate while it still covers every name and is not
+/// due for renewal. Any doubt (missing, unreadable, foreign, expiring) results
+/// in a fresh order.
+fn read_cached_certificate(config: &Config) -> Result<Option<(String, String)>> {
+    let cert_path = config.state_dir.join("cert.pem");
+    let key_path = config.state_dir.join("key.pem");
+    let (Ok(cert_pem), Ok(key_pem)) = (
+        fs::read_to_string(&cert_path),
+        fs::read_to_string(&key_path),
+    ) else {
+        return Ok(None);
+    };
+    let Ok(left) = remaining(&cert_pem) else {
+        return Ok(None);
+    };
+    if renewal_due(left, config.renew_before_days) || !covers(&cert_pem, &config.domains)? {
+        return Ok(None);
+    }
+    println!(
+        "reusing certificate from {}, {left:?} of lifetime left",
+        cert_path.display()
+    );
+    Ok(Some((cert_pem, key_pem)))
+}
+
+/// Lifetimes left on the leaf certificate in `pem`, or zero when expired.
+fn remaining(pem: &str) -> Result<Duration> {
+    let not_after = leaf_not_after(pem)?;
+    Ok(not_after
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO))
+}
+
+/// Whether the certificate expires within `renew_before_days`.
+fn renewal_due(remaining: Duration, renew_before_days: f64) -> bool {
+    remaining < Duration::from_secs_f64(renew_before_days * 86_400.0)
+}
+
+/// Whether the certificate carries exactly the configured DNS names.
+fn covers(pem: &str, domains: &[String]) -> Result<bool> {
+    let mut wanted = domains.to_vec();
+    wanted.sort();
+    let mut actual = leaf_dns_names(pem)?;
+    actual.sort();
+    Ok(actual == wanted)
+}
+
+fn leaf(pem: &str) -> Result<x509_parser::certificate::X509Certificate<'static>> {
+    let der = load_certs(pem)?
+        .into_iter()
+        .next()
+        .context("certificate PEM contains no certificate")?;
+    let owned = der.as_ref().to_vec();
+    let leaked: &'static [u8] = Box::leak(owned.into_boxed_slice());
+    let (_, cert) = x509_parser::parse_x509_certificate(leaked)
+        .map_err(|err| anyhow::anyhow!("parsing certificate: {err}"))?;
+    Ok(cert)
+}
+
+fn leaf_not_after(pem: &str) -> Result<SystemTime> {
+    let cert = leaf(pem)?;
+    let unix = cert.validity().not_after.timestamp();
+    Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(unix.max(0) as u64))
+}
+
+fn leaf_dns_names(pem: &str) -> Result<Vec<String>> {
+    let cert = leaf(pem)?;
+    let Some(san) = cert
+        .subject_alternative_name()
+        .map_err(anyhow::Error::from)?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            x509_parser::extensions::GeneralName::DNSName(dns) => Some(dns.to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
+#[derive(Debug)]
+struct CertStore {
+    current: RwLock<Arc<CertifiedKey>>,
+}
+
+impl CertStore {
+    fn new(cert_pem: &str, key_pem: &str) -> Result<Self> {
+        Ok(Self {
+            current: RwLock::new(Arc::new(certified_key(cert_pem, key_pem)?)),
+        })
+    }
+
+    fn replace(&self, cert_pem: &str, key_pem: &str) -> Result<()> {
+        let key = Arc::new(certified_key(cert_pem, key_pem)?);
+        *self.current.write().expect("certificate lock") = key;
+        Ok(())
+    }
+}
+
+impl ResolvesServerCert for CertStore {
+    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.current.read().expect("certificate lock").clone())
+    }
+}
+
+fn certified_key(cert_pem: &str, key_pem: &str) -> Result<CertifiedKey> {
+    let chain = load_certs(cert_pem)?;
+    let key = any_supported_type(&load_key(key_pem)?).context("loading signing key")?;
+    Ok(CertifiedKey::new(chain, key))
+}
+
+async fn renewal_loop(account: Account, config: Config, store: Arc<CertStore>) {
+    let period = Duration::from_secs(config.renew_check_interval_secs);
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let left = match fs::read_to_string(config.state_dir.join("cert.pem")) {
+            Ok(pem) => remaining(&pem).unwrap_or(Duration::ZERO),
+            Err(err) => {
+                eprintln!("renewal check: reading certificate: {err}");
+                continue;
+            }
+        };
+        if !renewal_due(left, config.renew_before_days) {
+            continue;
+        }
+        println!("certificate expires in {left:?}, renewing");
+        match obtain_certificate(&account, &config).await {
+            Ok((cert_pem, key_pem)) => {
+                if let Err(err) = store.replace(&cert_pem, &key_pem) {
+                    eprintln!("renewal check: preparing new certificate: {err:#}");
+                    continue;
+                }
+                let write = fs::write(config.state_dir.join("cert.pem"), cert_pem.as_bytes())
+                    .context("writing certificate")
+                    .and_then(|()| {
+                        write_secret(&config.state_dir.join("key.pem"), key_pem.as_bytes())
+                    });
+                match write {
+                    Ok(()) => {
+                        println!("certificate renewed");
+                        report_ct(config.clone()).await;
+                    }
+                    Err(err) => eprintln!("renewal check: storing certificate: {err:#}"),
+                }
+            }
+            Err(err) => eprintln!("renewal failed: {err:#}"),
+        }
+    }
 }
 
 fn load_config(path: &str) -> Result<Config> {
@@ -124,11 +334,27 @@ fn load_config(path: &str) -> Result<Config> {
     if config.ca.ttl == 0 {
         bail!("ca.ttl must be greater than zero");
     }
+    validate_renewal(config.certificate_days, config.renew_before_days)?;
+    if config.renew_check_interval_secs == 0 {
+        bail!("renew_check_interval_secs must be greater than zero");
+    }
     if config.ca.eab_kid.is_some() != config.ca.eab_hmac_key.is_some() {
         bail!("ca.eab_kid and ca.eab_hmac_key must be set together");
     }
 
     Ok(config)
+}
+
+fn validate_renewal(certificate_days: u32, renew_before_days: f64) -> Result<()> {
+    if !(1..=90).contains(&certificate_days) {
+        bail!("certificate_days must be between 1 and 90");
+    }
+    if !(renew_before_days.is_finite() && renew_before_days > 0.0)
+        || renew_before_days >= f64::from(certificate_days)
+    {
+        bail!("renew_before_days must be above 0 and below certificate_days");
+    }
+    Ok(())
 }
 
 fn normalize_domains(raw: &[String]) -> Result<Vec<String>> {
@@ -229,7 +455,15 @@ async fn obtain_certificate(account: &Account, config: &Config) -> Result<(Strin
         .iter()
         .map(|domain| Identifier::Dns(domain.clone()))
         .collect::<Vec<_>>();
-    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
+    let not_before = time::OffsetDateTime::now_utc();
+    let not_after = not_before + time::Duration::days(i64::from(config.certificate_days));
+    let mut order = account
+        .new_order(
+            &NewOrder::new(&identifiers)
+                .not_before(not_before)
+                .not_after(not_after),
+        )
+        .await?;
     println!("dns-persist metadata: {:?}", account.dns_persist_metadata());
 
     // All names of one domain share the same record, so only print it once.
@@ -286,7 +520,11 @@ async fn obtain_certificate(account: &Account, config: &Config) -> Result<(Strin
 
     let key_pem = order.finalize().await?;
     let cert_pem = order.poll_certificate(&retry).await?;
-    println!("certificate issued for {}", config.domains.join(", "));
+    let lifetime = remaining(&cert_pem).unwrap_or_default();
+    println!(
+        "certificate issued for {} (lifetime {lifetime:?})",
+        config.domains.join(", ")
+    );
     Ok((cert_pem, key_pem))
 }
 
@@ -304,6 +542,220 @@ fn challenge_types(authorization: &instant_acme::AuthorizationHandle<'_>) -> Vec
             _ => "unknown",
         })
         .collect()
+}
+
+async fn report_ct(config: Config) {
+    if !config.ct_lookup {
+        return;
+    }
+    if let Err(err) = print_ct_certificates(&config).await {
+        eprintln!("CT log lookup failed: {err:#}");
+    }
+}
+
+type CtClient = Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    Full<Bytes>,
+>;
+
+struct CtEntry {
+    id: String,
+    names: Vec<String>,
+    not_before: String,
+    not_after: String,
+    fingerprint: String,
+    revoked: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct CertSpotterEntry {
+    id: String,
+    cert_sha256: String,
+    dns_names: Vec<String>,
+    not_before: String,
+    not_after: String,
+    #[serde(default)]
+    revoked: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct CrtShEntry {
+    id: u64,
+    common_name: Option<String>,
+    name_value: String,
+    not_before: String,
+    not_after: String,
+    serial_number: String,
+}
+
+/// Print every still-valid certificate that public CT search services know for
+/// the configured names. Failures are non-fatal for the caller.
+///
+/// Certificate Transparency logs themselves have no name index, so a search
+/// service is required. Cert Spotter is queried first; crt.sh is the fallback
+/// because the unauthenticated Cert Spotter rate limit is low.
+async fn print_ct_certificates(config: &Config) -> Result<()> {
+    let mut bases = config
+        .domains
+        .iter()
+        .map(|domain| domain.strip_prefix("*.").unwrap_or(domain).to_owned())
+        .collect::<Vec<_>>();
+    bases.sort();
+    bases.dedup();
+
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .context("loading native root certificates")?
+        .https_only()
+        .enable_http1()
+        .build();
+    let client: CtClient = Client::builder(TokioExecutor::new()).build(connector);
+
+    let now = OffsetDateTime::now_utc();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut found = Vec::new();
+    for base in bases {
+        for entry in ct_fetch(&client, &base).await? {
+            let (Some(not_before), Some(not_after)) = (
+                ct_parse_time(&entry.not_before),
+                ct_parse_time(&entry.not_after),
+            ) else {
+                continue;
+            };
+            if !ct_is_current(not_before, not_after, now) || !seen.insert(entry.fingerprint.clone())
+            {
+                continue;
+            }
+            if !entry
+                .names
+                .iter()
+                .any(|name| ct_name_on_domain(name, &config.domains))
+            {
+                continue;
+            }
+            found.push((not_before, not_after, entry));
+        }
+    }
+
+    found.sort_by_key(|(_, not_after, _)| *not_after);
+    println!();
+    println!(
+        "Still-valid certificates in Certificate Transparency for {}:",
+        config.domains.join(", ")
+    );
+    if found.is_empty() {
+        println!("  none");
+        println!();
+        return Ok(());
+    }
+    for (not_before, not_after, entry) in &found {
+        println!(
+            "  {} .. {}  id={}  names={}{}",
+            not_before.format(&Rfc3339)?,
+            not_after.format(&Rfc3339)?,
+            entry.id,
+            entry.names.join(","),
+            if entry.revoked { "  revoked" } else { "" },
+        );
+    }
+    println!();
+    Ok(())
+}
+
+async fn ct_fetch(client: &CtClient, base: &str) -> Result<Vec<CtEntry>> {
+    match ct_fetch_certspotter(client, base).await {
+        Ok(entries) => Ok(entries),
+        Err(primary) => match ct_fetch_crtsh(client, base).await {
+            Ok(entries) => {
+                eprintln!("Cert Spotter failed ({primary:#}), fell back to crt.sh");
+                Ok(entries)
+            }
+            Err(fallback) => bail!("Cert Spotter: {primary:#}; crt.sh: {fallback:#}"),
+        },
+    }
+}
+
+async fn ct_fetch_certspotter(client: &CtClient, base: &str) -> Result<Vec<CtEntry>> {
+    let uri = format!(
+        "https://api.certspotter.com/v1/issuances?domain={base}&include_subdomains=true&expand=dns_names"
+    );
+    let body = ct_get(client, &uri).await?;
+    let entries: Vec<CertSpotterEntry> =
+        serde_json::from_slice(&body).with_context(|| format!("parsing {uri}"))?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| CtEntry {
+            id: entry.id,
+            names: entry.dns_names,
+            not_before: entry.not_before,
+            not_after: entry.not_after,
+            fingerprint: entry.cert_sha256,
+            revoked: entry.revoked,
+        })
+        .collect())
+}
+
+async fn ct_fetch_crtsh(client: &CtClient, base: &str) -> Result<Vec<CtEntry>> {
+    let uri = format!("https://crt.sh/?q={base}&output=json");
+    let body = ct_get(client, &uri).await?;
+    let entries: Vec<CrtShEntry> =
+        serde_json::from_slice(&body).with_context(|| format!("parsing {uri}"))?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| CtEntry {
+            id: entry.id.to_string(),
+            names: entry
+                .name_value
+                .split('\n')
+                .chain(entry.common_name.as_deref())
+                .map(|name| name.trim().to_owned())
+                .collect(),
+            not_before: entry.not_before,
+            not_after: entry.not_after,
+            fingerprint: entry.serial_number,
+            revoked: false,
+        })
+        .collect())
+}
+
+async fn ct_get(client: &CtClient, uri: &str) -> Result<Vec<u8>> {
+    let request = Request::builder()
+        .uri(uri)
+        .header("user-agent", "dns-persist-example")
+        .body(Full::new(Bytes::new()))?;
+    let response = tokio::time::timeout(Duration::from_secs(20), client.request(request))
+        .await
+        .context("CT request timed out")??;
+    if !response.status().is_success() {
+        bail!("{uri} answered {}", response.status());
+    }
+    Ok(response.into_body().collect().await?.to_bytes().to_vec())
+}
+
+fn ct_parse_time(raw: &str) -> Option<OffsetDateTime> {
+    if let Ok(parsed) = OffsetDateTime::parse(raw.trim(), &Rfc3339) {
+        return Some(parsed);
+    }
+    let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+    PrimitiveDateTime::parse(raw.trim(), &format)
+        .ok()
+        .map(PrimitiveDateTime::assume_utc)
+}
+
+fn ct_is_current(
+    not_before: OffsetDateTime,
+    not_after: OffsetDateTime,
+    now: OffsetDateTime,
+) -> bool {
+    not_before <= now && now < not_after
+}
+
+fn ct_name_on_domain(name: &str, domains: &[String]) -> bool {
+    let name = name.trim().trim_end_matches('.');
+    domains.iter().any(|domain| {
+        let base = domain.strip_prefix("*.").unwrap_or(domain);
+        name == base || name.ends_with(&format!(".{base}"))
+    })
 }
 
 fn print_record(response: &dns_persist01::Response, ttl: u32) {
@@ -343,12 +795,10 @@ async fn wait_for_enter() -> Result<()> {
     Ok(())
 }
 
-async fn serve(config: &Config, cert_pem: &str, key_pem: &str) -> Result<()> {
-    let certs = load_certs(cert_pem)?;
-    let key = load_key(key_pem)?;
+async fn serve(config: &Config, store: Arc<CertStore>) -> Result<()> {
     let tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+        .with_cert_resolver(store);
 
     let acceptor = TlsAcceptor::from(Arc::new(tls));
     let listener = TcpListener::bind(config.bind).await?;
@@ -439,6 +889,19 @@ fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{CertificateParams, KeyPair};
+    use time::Duration as TimeDuration;
+
+    fn self_signed(domains: &[&str], days: i64) -> (String, String) {
+        let names: Vec<String> = domains.iter().map(|name| name.to_string()).collect();
+        let mut params = CertificateParams::new(names).unwrap();
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - TimeDuration::minutes(5);
+        params.not_after = now + TimeDuration::days(days);
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
 
     #[test]
     fn bundled_config_uses_google_values() {
@@ -448,6 +911,10 @@ mod tests {
             "https://dv.acme-v02.api.pki.goog/directory"
         );
         assert_eq!(config.domains, ["example.com", "*.example.com"]);
+        assert_eq!(config.certificate_days, 7);
+        assert_eq!(config.renew_before_days, 3.0);
+        assert_eq!(config.renew_check_interval_secs, 3600);
+        assert!(config.ct_lookup);
         assert_eq!(config.ca.issuer_domain_name, "pki.goog");
         assert_eq!(config.ca.ttl, 3600);
         assert_eq!(config.ca.eab_kid.as_deref(), Some("REPLACE_WITH_EAB_KID"));
@@ -482,6 +949,101 @@ mod tests {
         );
         assert!(normalize_domains(&[]).is_err());
         assert!(normalize_domains(&["nope".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn reports_remaining_lifetime() {
+        let (cert, _) = self_signed(&["example.com"], 7);
+        let left = remaining(&cert).unwrap();
+        assert!(left > Duration::from_secs(6 * 86_400));
+        assert!(left <= Duration::from_secs(7 * 86_400));
+
+        let (expired, _) = self_signed(&["example.com"], -1);
+        assert_eq!(remaining(&expired).unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn matches_certificate_names() {
+        let (cert, _) = self_signed(&["example.com", "*.example.com"], 7);
+        let wanted = ["example.com".to_owned(), "*.example.com".to_owned()];
+        assert!(covers(&cert, &wanted).unwrap());
+
+        let narrower = ["example.com".to_owned()];
+        assert!(!covers(&cert, &narrower).unwrap());
+
+        let wider = [
+            "example.com".to_owned(),
+            "*.example.com".to_owned(),
+            "www.example.com".to_owned(),
+        ];
+        assert!(!covers(&cert, &wider).unwrap());
+    }
+
+    #[test]
+    fn renews_below_the_threshold() {
+        assert!(renewal_due(Duration::from_secs(13 * 86_400), 14.0));
+        assert!(renewal_due(Duration::ZERO, 14.0));
+        assert!(renewal_due(Duration::from_secs(30), 14.0));
+        assert!(!renewal_due(Duration::from_secs(15 * 86_400), 14.0));
+    }
+
+    #[test]
+    fn rejects_a_renewal_window_beyond_the_lifetime() {
+        assert!(validate_renewal(7, 3.0).is_ok());
+        assert!(validate_renewal(7, 0.5).is_ok());
+        assert!(validate_renewal(7, 7.0).is_err());
+        assert!(validate_renewal(7, 0.0).is_err());
+        assert!(validate_renewal(7, f64::NAN).is_err());
+        assert!(validate_renewal(0, 1.0).is_err());
+        assert!(validate_renewal(91, 3.0).is_err());
+    }
+
+    #[test]
+    fn renewal_defaults_apply() {
+        let config: Config =
+            toml::from_str("domains = ['example.com']\n[ca]\ndirectory_url = 'https://ca.example/directory'\nissuer_domain_name = 'ca.example'")
+                .unwrap();
+        assert_eq!(config.certificate_days, 7);
+        assert_eq!(config.renew_before_days, 3.0);
+        assert_eq!(config.renew_check_interval_secs, 3600);
+        assert!(config.ct_lookup);
+    }
+
+    #[test]
+    fn ct_names_must_be_on_a_configured_domain() {
+        let domains = ["example.com".to_owned(), "*.example.com".to_owned()];
+        assert!(ct_name_on_domain("example.com", &domains));
+        assert!(ct_name_on_domain("*.example.com", &domains));
+        assert!(ct_name_on_domain("www.example.com", &domains));
+        assert!(!ct_name_on_domain("example.org", &domains));
+        assert!(!ct_name_on_domain("notexample.com", &domains));
+    }
+
+    #[test]
+    fn ct_entries_need_to_be_valid_now() {
+        let now = OffsetDateTime::now_utc();
+        assert!(ct_is_current(
+            now - TimeDuration::days(1),
+            now + TimeDuration::days(1),
+            now
+        ));
+        assert!(!ct_is_current(
+            now - TimeDuration::days(3),
+            now - TimeDuration::days(1),
+            now
+        ));
+        assert!(!ct_is_current(
+            now + TimeDuration::days(1),
+            now + TimeDuration::days(3),
+            now
+        ));
+    }
+
+    #[test]
+    fn ct_timestamps_parse() {
+        assert!(ct_parse_time("2026-11-18T00:00:26").is_some());
+        assert!(ct_parse_time("2026-11-18T00:00:26Z").is_some());
+        assert!(ct_parse_time("not a date").is_none());
     }
 
     #[test]

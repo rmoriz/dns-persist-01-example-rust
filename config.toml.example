@@ -9,6 +9,22 @@
 # "Wildcard certificates" section of the README.
 domains = ["example.com", "*.example.com"]
 
+# Requested certificate lifetime in days. Google Trust Services accepts 1 to 90
+# and recommends at least 3. The running server renews in place, so short
+# lifetimes need no restart.
+certificate_days = 7
+
+# Renew once less than this many days of lifetime remain. Must be above 0 and
+# below certificate_days; fractions are allowed.
+renew_before_days = 3
+
+# How often the running server checks the lifetime, in seconds.
+renew_check_interval_secs = 3600
+
+# After issuing, print still-valid certificates for these names from
+# Certificate Transparency (Cert Spotter, crt.sh as fallback).
+ct_lookup = true
+
 # Contact URI sent when the ACME account is created. Change this.
 contact = "mailto:admin@example.com"
 

@@ -137,26 +137,77 @@ Things worth knowing:
   not need a wildcard DNS record for validation. You do still need `A`/`AAAA`
   records for the names you actually serve.
 
-## Renewals
+## Lifetime and renewal
 
-Run the same command again. The persisted account regenerates the same record,
-so the authorization becomes valid without changing DNS. Because the record is
-persistent, this also works unattended once it exists:
+Certificates are requested with a short lifetime: `certificate_days`, default
+`7`. Google Trust Services honours anything from 1 to 90 days and recommends
+at least 3. A CA may ignore the request; the setting is only a hint.
+
+While the server runs it checks the stored certificate every
+`renew_check_interval_secs` (default `3600`) and orders a replacement as soon
+as less than `renew_before_days` remain (default `3`, fractions allowed for
+testing). The replacement is swapped into the live TLS configuration, so the
+listener and every existing connection stay up while `state/cert.pem` and
+`state/key.pem` are rewritten.
+
+`renew_before_days` must be above 0 and below `certificate_days`. A threshold
+at or above the requested lifetime would renew on every check.
+
+```toml
+certificate_days = 7
+renew_before_days = 3
+renew_check_interval_secs = 3600
+```
+
+Renewals reuse the persisted account and the already published record, so they
+run unattended: no DNS change, no prompt. Only if the record has to be
+re-authorized and stdin is a terminal does the example print it again and wait
+for Enter.
+
+Restarting also does not churn certificates — a stored certificate that still
+covers every configured name and is not due for renewal is reused. Delete
+`state/account.json` if you want a fresh account; that changes the record, so
+you must update DNS again.
+
+Manual re-runs still work and renew on the spot:
 
 ```console
 $ cargo run < /dev/null
 ```
 
-Delete `state/account.json` if you want a fresh account — that also changes the
-record, so you must update DNS again.
+Because the record is persistent, that works unattended once it exists.
+
+## Certificate Transparency
+
+After issuing and after every renewal the example prints still-valid
+certificates for the configured names from Certificate Transparency:
+
+```text
+Still-valid certificates in Certificate Transparency for example.com, *.example.com:
+  2026-11-18T01:08:14Z .. 2026-11-20T01:08:14Z  id=18453679703  names=*.example.com,example.com
+  2026-09-25T13:38:29Z .. 2026-12-24T13:38:28Z  id=17408030496  names=example.com
+```
+
+This is a lookup, not a substitute for surveillance: an unexpected certificate
+is worth investigating, and a certificate missing here only means CT
+submission is still in flight.
+
+CT logs have no name index, so the search goes through a service: Cert Spotter
+first, crt.sh as fallback. Both are third parties and learn the base domain
+names. The unauthenticated Cert Spotter limit is low (10 requests per hour),
+so rapid restarts may fall back or fail softly.
+
+Set `ct_lookup = false` to skip the lookup. Failures are warnings and never
+affect issuance or renewal. Revoked certificates are listed and marked
+`revoked`.
 
 ## Files
 
-| Path                 | Contents                                     |
-| -------------------- | -------------------------------------------- |
-| `state/account.json` | ACME account credentials                     |
-| `state/cert.pem`     | Issued certificate chain                     |
-| `state/key.pem`      | Certificate private key (mode `0600`)        |
+| Path                 | Contents                                      |
+| -------------------- | --------------------------------------------- |
+| `state/account.json` | ACME account credentials                      |
+| `state/cert.pem`     | Issued certificate chain, replaced on renewal |
+| `state/key.pem`      | Certificate private key (mode `0600`)         |
 
 Both secret files are written with mode `0600`. `state/` is git-ignored.
 

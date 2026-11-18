@@ -199,6 +199,9 @@ name = "deranged"
 version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "displaydoc"
@@ -220,15 +223,19 @@ dependencies = [
  "base64",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "instant-acme",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tokio-rustls",
  "toml",
+ "x509-parser",
 ]
 
 [[package]]
@@ -432,6 +439,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "log",
  "rustls",
  "rustls-native-certs",
  "rustls-platform-verifier",
@@ -493,6 +501,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "time",
  "tokio",
 ]
 
