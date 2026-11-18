@@ -15,7 +15,13 @@ from a per-order token. You publish it **once**; later runs reuse it.
 
 ## Configuration
 
-`config.toml` is pre-filled with Google Trust Services values:
+Copy the bundled template, then edit it:
+
+```console
+$ cp config.toml.example config.toml
+```
+
+`config.toml.example` is pre-filled with Google Trust Services values:
 
 ```toml
 domain = "example.com"

@@ -99,8 +99,9 @@ async fn main() -> Result<()> {
 }
 
 fn load_config(path: &str) -> Result<Config> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("reading configuration from {path}"))?;
+    let raw = fs::read_to_string(path).with_context(|| {
+        format!("reading configuration from {path} (did you copy config.toml.example?)")
+    })?;
     let mut config: Config = toml::from_str(&raw).context("parsing configuration")?;
 
     config.domain = normalize_domain(&config.domain)?;
@@ -407,7 +408,7 @@ mod tests {
 
     #[test]
     fn bundled_config_uses_google_values() {
-        let config: Config = toml::from_str(include_str!("../config.toml")).unwrap();
+        let config: Config = toml::from_str(include_str!("../config.toml.example")).unwrap();
         assert_eq!(
             config.ca.directory_url,
             "https://dv.acme-v02.api.pki.goog/directory"
