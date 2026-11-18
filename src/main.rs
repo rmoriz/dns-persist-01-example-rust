@@ -14,6 +14,7 @@
 //! configuration is swapped in place, so no restart and no dropped listener.
 
 use std::{
+    fmt::Write as _,
     fs,
     io::{BufReader, Write},
     net::SocketAddr,
@@ -23,7 +24,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use aws_lc_rs::hmac;
+use aws_lc_rs::{digest, hmac};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use http_body_util::{BodyExt, Full};
@@ -548,7 +549,10 @@ async fn report_ct(config: Config) {
     if !config.ct_lookup {
         return;
     }
-    if let Err(err) = print_ct_certificates(&config).await {
+    let served = fs::read_to_string(config.state_dir.join("cert.pem"))
+        .ok()
+        .and_then(|pem| served_identity(&pem).ok());
+    if let Err(err) = print_ct_certificates(&config, served.as_ref()).await {
         eprintln!("CT log lookup failed: {err:#}");
     }
 }
@@ -594,7 +598,7 @@ struct CrtShEntry {
 /// Certificate Transparency logs themselves have no name index, so a search
 /// service is required. Cert Spotter is queried first; crt.sh is the fallback
 /// because the unauthenticated Cert Spotter rate limit is low.
-async fn print_ct_certificates(config: &Config) -> Result<()> {
+async fn print_ct_certificates(config: &Config, served: Option<&ServedCert>) -> Result<()> {
     let mut bases = config
         .domains
         .iter()
@@ -648,9 +652,17 @@ async fn print_ct_certificates(config: &Config) -> Result<()> {
         println!();
         return Ok(());
     }
+    let mut marked = false;
     for (not_before, not_after, entry) in &found {
+        let current = served.is_some_and(|served| ct_matches_served(entry, served));
+        marked |= current;
         println!(
-            "  {} .. {}  id={}  names={}{}",
+            "  {}{} .. {}  id={}  names={}{}",
+            if current {
+                "\x1b[32m\u{2192}\x1b[0m "
+            } else {
+                "  "
+            },
             not_before.format(&Rfc3339)?,
             not_after.format(&Rfc3339)?,
             entry.id,
@@ -658,8 +670,51 @@ async fn print_ct_certificates(config: &Config) -> Result<()> {
             if entry.revoked { "  revoked" } else { "" },
         );
     }
+    if marked {
+        println!();
+        println!("  \x1b[32m\u{2192}\x1b[0m the certificate this process is serving");
+    }
     println!();
     Ok(())
+}
+
+/// Identity of the certificate currently being served, used to point at its CT
+/// entry. Compared against both the certificate hash and the serial number
+/// because the two search services report different fields.
+struct ServedCert {
+    fingerprint: String,
+    serial: String,
+    not_after: i64,
+}
+
+fn served_identity(pem: &str) -> Result<ServedCert> {
+    let der = load_certs(pem)?
+        .into_iter()
+        .next()
+        .context("certificate PEM contains no certificate")?;
+    let digest = digest::digest(&digest::SHA256, der.as_ref());
+    let mut fingerprint = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        write!(fingerprint, "{byte:02x}")?;
+    }
+    let leaf = leaf(pem)?;
+    Ok(ServedCert {
+        fingerprint,
+        serial: leaf.raw_serial_as_string().to_ascii_lowercase(),
+        not_after: leaf.validity().not_after.timestamp(),
+    })
+}
+
+fn ct_matches_served(entry: &CtEntry, served: &ServedCert) -> bool {
+    fn normalize(value: &str) -> String {
+        value.trim_start_matches('0').to_ascii_lowercase()
+    }
+    entry.fingerprint.eq_ignore_ascii_case(&served.fingerprint)
+        || normalize(&entry.fingerprint) == normalize(&served.serial)
+        // Cert Spotter hashes the precertificate, which differs from the issued
+        // certificate by its SCT extension; certify identity by expiry then.
+        || ct_parse_time(&entry.not_after)
+            .is_some_and(|not_after| not_after.unix_timestamp() == served.not_after)
 }
 
 async fn ct_fetch(client: &CtClient, base: &str) -> Result<Vec<CtEntry>> {
@@ -1037,6 +1092,29 @@ mod tests {
             now + TimeDuration::days(3),
             now
         ));
+    }
+
+    #[test]
+    fn marks_the_served_certificate() {
+        let (cert, _) = self_signed(&["example.com"], 7);
+        let served = served_identity(&cert).unwrap();
+        let mut entry = CtEntry {
+            id: "1".to_owned(),
+            names: vec!["example.com".to_owned()],
+            not_before: String::new(),
+            not_after: String::new(),
+            fingerprint: served.fingerprint.clone(),
+            revoked: false,
+        };
+        assert!(ct_matches_served(&entry, &served));
+        entry.fingerprint = served.serial.clone();
+        assert!(ct_matches_served(&entry, &served));
+        entry.fingerprint = "deadbeef".to_owned();
+        assert!(!ct_matches_served(&entry, &served));
+
+        let not_after = OffsetDateTime::from_unix_timestamp(served.not_after).unwrap();
+        entry.not_after = not_after.format(&Rfc3339).unwrap();
+        assert!(ct_matches_served(&entry, &served));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # dns-persist-01 example
 
+[![CI](https://github.com/rmoriz/dns-persist-01-example-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/rmoriz/dns-persist-01-example-rust/actions/workflows/ci.yml)
+
 A small HTTPS server that gets its certificate with the ACME
 `dns-persist-01` challenge from [instant-acme](../instant-acme). The
 validation record is derived from your account, the domain and the CA, not
@@ -184,9 +186,16 @@ certificates for the configured names from Certificate Transparency:
 
 ```text
 Still-valid certificates in Certificate Transparency for example.com, *.example.com:
-  2026-11-18T01:08:14Z .. 2026-11-20T01:08:14Z  id=18453679703  names=*.example.com,example.com
-  2026-09-25T13:38:29Z .. 2026-12-24T13:38:28Z  id=17408030496  names=example.com
+    2026-11-18T01:08:14Z .. 2026-11-20T01:08:14Z  id=18453679703  names=*.example.com,example.com
+  → 2026-11-18T01:10:19Z .. 2026-11-25T01:10:19Z  id=18453769867  names=*.example.com,example.com
+    2026-09-25T13:38:29Z .. 2026-12-24T13:38:28Z  id=17408030496  names=example.com
+
+  → the certificate this process is serving
 ```
+
+The green arrow marks the certificate currently in use. It is matched by
+certificate hash, serial number or expiry, because Cert Spotter hashes the
+precertificate rather than the issued certificate.
 
 This is a lookup, not a substitute for surveillance: an unexpected certificate
 is worth investigating, and a certificate missing here only means CT
